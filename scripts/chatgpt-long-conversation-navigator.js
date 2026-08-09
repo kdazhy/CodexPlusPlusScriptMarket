@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话导航与预览（Codex++）
 // @namespace    https://github.com/kdazhy
-// @version      6.1.0
+// @version      6.1.1
 // @description  为 ChatGPT Windows 桌面端长对话提供提问索引、悬浮预览、精确跳转和快捷键导航。
 // @author       kdazhy
 // @match        https://chatgpt.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '6.1.0';
+  const VERSION = '6.1.1';
   const INSTALL_KEY = '__codexPlusChatConversationNavigator';
   const LOCK_ID = 'cgpt-codex-navigator-lock';
   const HOST_ID = 'cgpt-codex-navigator-v6-host';
@@ -988,8 +988,16 @@
 
   function scheduleScan(delay = CONFIG.scanDebounceMs) {
     if (state.destroyed) return;
-    clearTimeout(state.scanTimer);
-    state.scanTimer = setTimeout(scanMessages, delay);
+
+    if (state.scanTimer) {
+      if (delay > 0) return;
+      clearTimeout(state.scanTimer);
+    }
+
+    state.scanTimer = setTimeout(() => {
+      state.scanTimer = null;
+      scanMessages();
+    }, delay);
   }
 
   function observeDOM() {

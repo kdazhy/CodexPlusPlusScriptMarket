@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-08T03:11:36Z",
+  "updated_at": "2026-08-09T02:37:49Z",
   "scripts": [
     {
       "id": "codex-context-used-meter",
@@ -246,7 +246,7 @@
       "id": "chatgpt-long-conversation-navigator",
       "name": "ChatGPT 长对话导航与预览",
       "description": "为 ChatGPT/Codex Windows 桌面端长对话提供右侧提问索引、悬浮标题预览、精确跳转、当前阅读位置高亮和 Alt+↑/↓ 快捷导航；支持浅深主题与 Codex++ 热重载。",
-      "version": "6.1.0",
+      "version": "6.1.1",
       "author": "kdazhy",
       "tags": [
         "chatgpt",
@@ -260,7 +260,7 @@
       ],
       "homepage": "https://github.com/kdazhy/CodexPlusPlusScriptMarket",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/chatgpt-long-conversation-navigator.js",
-      "sha256": "e8b7bbb15f22cc53c6e1710621c111731ca2bbb4273f57b507cb8ad164e07e0d"
+      "sha256": "bee2e8b79a5590c963f0137ac00a9cc2121a74fb90cebf4a9480fefc78d21412"
     }
   ]
 }
