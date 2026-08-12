@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话双侧导航与预览（Codex++）
 // @namespace    https://github.com/kdazhy
-// @version      6.4.0
+// @version      6.5.0
 // @description  为 ChatGPT Windows 桌面端提供完整会话提问索引、聊天/任务回答章节索引、精确跳转和动态布局避让。
 // @author       kdazhy
 // @match        https://chatgpt.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '6.4.0';
+  const VERSION = '6.5.0';
   const INSTALL_KEY = '__codexPlusChatConversationNavigator';
   const LOCK_ID = 'cgpt-codex-navigator-lock';
   const HOST_ID = 'cgpt-codex-navigator-v6-host';
@@ -42,14 +42,12 @@
     titleMaxChars: 72,
     chapterTitleMaxChars: 70,
     fallbackChapterMinChars: 700,
-    fallbackChapterMinHeight: 720,
-    fallbackChapterMaxChars: 96,
-    fallbackChapterLabelMaxChars: 44,
+    fallbackChapterMaxChars: 82,
     fallbackChapterMinGapPx: 28,
     fallbackChapterMaxCount: 12,
+    chapterMaxVisibleCount: 8,
     chapterMinVisibleCount: 3,
-    chapterMinAnswerChars: 700,
-    chapterMinAnswerHeight: 720,
+    chapterMinAnswerChars: 1200,
     readingAnchorRatio: 0.30,
     scanDebounceMs: 180,
     scanIdleTimeoutMs: 260,
@@ -336,6 +334,18 @@
     return match ? Number(match[1]) : 2;
   }
 
+  function isSemanticChapterHeading(node) {
+    if (
+      !isVisibleChapterTarget(node) ||
+      node.closest?.('pre, blockquote, ul, ol, table')
+    ) {
+      return false;
+    }
+
+    const text = oneLine(node.innerText || node.textContent || '');
+    return text.length >= 2 && text.length <= CONFIG.chapterTitleMaxChars;
+  }
+
   function isVisibleChapterTarget(node) {
     if (
       !node?.isConnected ||
@@ -359,15 +369,10 @@
     if (children.length !== 1 || emphasis.length !== 1) return false;
 
     const emphasisText = oneLine(emphasis[0].innerText || emphasis[0].textContent || '');
-    return Boolean(emphasisText) && emphasisText === text;
-  }
-
-  function isStandaloneChapterLabel(text) {
     return (
-      text.length <= CONFIG.fallbackChapterLabelMaxChars &&
-      /[:：]$/.test(text) &&
-      !/[。！？.!?]/.test(text.slice(0, -1)) &&
-      !/[，,]/.test(text.slice(0, -1))
+      Boolean(emphasisText) &&
+      emphasisText === text &&
+      !/[。！？.!?：:]$/.test(text)
     );
   }
 
@@ -391,11 +396,9 @@
       return false;
     }
 
-    return (
-      isNumberedChapterTitle(text) ||
-      isStandaloneEmphasis(node, text) ||
-      isStandaloneChapterLabel(text)
-    );
+    if (/[。！？.!?：:，,；;]$/.test(text)) return false;
+
+    return isNumberedChapterTitle(text) || isStandaloneEmphasis(node, text);
   }
 
   function toChapter(target, level = 2, synthetic = false) {
@@ -410,12 +413,8 @@
   }
 
   function buildFallbackChapters(root) {
-    const rootRect = root.getBoundingClientRect();
     const rootText = oneLine(root.innerText || root.textContent || '');
-    if (
-      rootText.length < CONFIG.fallbackChapterMinChars &&
-      rootRect.height < CONFIG.fallbackChapterMinHeight
-    ) {
+    if (rootText.length < CONFIG.fallbackChapterMinChars) {
       return [];
     }
 
@@ -437,31 +436,38 @@
     return chapters.filter(chapter => chapter.fullText);
   }
 
+  function limitChapterLevels(chapters) {
+    const allowedLevels = [...new Set(chapters.map(chapter => chapter.level))]
+      .sort((left, right) => left - right)
+      .slice(0, 2);
+    const allowed = new Set(allowedLevels);
+    return chapters
+      .filter(chapter => allowed.has(chapter.level))
+      .slice(0, CONFIG.chapterMaxVisibleCount);
+  }
+
   function buildChapterModel(item) {
     const root = item?.assistantRoot;
     if (!root?.isConnected) return [];
 
     const rootText = oneLine(root.innerText || root.textContent || '');
-    const rootRect = root.getBoundingClientRect();
-    if (
-      rootText.length < CONFIG.chapterMinAnswerChars &&
-      rootRect.height < CONFIG.chapterMinAnswerHeight
-    ) {
+    if (rootText.length < CONFIG.chapterMinAnswerChars) {
       return [];
     }
 
     const semanticChapters = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6')]
-      .filter(isVisibleChapterTarget)
+      .filter(isSemanticChapterHeading)
       .map(heading => toChapter(heading, getHeadingLevel(heading)))
       .filter(chapter => chapter.fullText);
+    const limitedSemanticChapters = limitChapterLevels(semanticChapters);
 
-    if (semanticChapters.length) {
-      return semanticChapters.length >= CONFIG.chapterMinVisibleCount
-        ? semanticChapters
+    if (limitedSemanticChapters.length) {
+      return limitedSemanticChapters.length >= CONFIG.chapterMinVisibleCount
+        ? limitedSemanticChapters
         : [];
     }
 
-    const fallbackChapters = buildFallbackChapters(root);
+    const fallbackChapters = limitChapterLevels(buildFallbackChapters(root));
     return fallbackChapters.length >= CONFIG.chapterMinVisibleCount
       ? fallbackChapters
       : [];

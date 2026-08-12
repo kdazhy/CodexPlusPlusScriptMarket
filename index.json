@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-12T03:21:10Z",
+  "updated_at": "2026-08-12T03:45:39Z",
   "scripts": [
     {
       "id": "codex-context-used-meter",
@@ -245,8 +245,8 @@
     {
       "id": "chatgpt-long-conversation-navigator",
       "name": "ChatGPT 长对话双侧导航与预览",
-      "description": "为 ChatGPT/Codex Windows 桌面端提供完整会话提问索引和聊天/任务回答章节索引，支持虚拟历史懒加载预览、严格章节识别、长回答章节门槛、精确跳转、流式性能优化、原生边栏避让与热重载。",
-      "version": "6.4.0",
+      "description": "为 ChatGPT/Codex Windows 桌面端提供完整会话提问索引和聊天/任务回答章节索引，支持严格章节识别、最多两层主要标题、长回答章节门槛、虚拟历史懒加载预览、精确跳转、流式性能优化、原生边栏避让与热重载。",
+      "version": "6.5.0",
       "author": "kdazhy",
       "tags": [
         "chatgpt",
@@ -261,7 +261,7 @@
       ],
       "homepage": "https://github.com/kdazhy/CodexPlusPlusScriptMarket",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/chatgpt-long-conversation-navigator.js",
-      "sha256": "4e9d983545375c7f37990efb72ccc41ef1bfb1507374c60f70a2559f1688731d"
+      "sha256": "097cf0cbeb8cc1f440542e3d752044fc835a7455b36457efb43baa18a14e597d"
     }
   ]
 }
