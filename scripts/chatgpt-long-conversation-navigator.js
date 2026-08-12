@@ -746,7 +746,6 @@
           padding: 0;
           overflow-x: hidden;
           overflow-y: auto;
-          contain: layout paint;
           will-change: scroll-position;
           overscroll-behavior: contain;
           scrollbar-width: none;

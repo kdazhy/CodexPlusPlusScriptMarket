@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-12T03:16:23Z",
+  "updated_at": "2026-08-12T03:21:10Z",
   "scripts": [
     {
       "id": "codex-context-used-meter",
@@ -261,7 +261,7 @@
       ],
       "homepage": "https://github.com/kdazhy/CodexPlusPlusScriptMarket",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/chatgpt-long-conversation-navigator.js",
-      "sha256": "3d23f30309f6d9122120fcee911c2f9d00f0b4f9389f0a577747abf46b4fc14a"
+      "sha256": "4e9d983545375c7f37990efb72ccc41ef1bfb1507374c60f70a2559f1688731d"
     }
   ]
 }
