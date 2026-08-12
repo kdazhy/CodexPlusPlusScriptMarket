@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话双侧导航与预览（Codex++）
 // @namespace    https://github.com/kdazhy
-// @version      6.3.0
+// @version      6.4.0
 // @description  为 ChatGPT Windows 桌面端提供完整会话提问索引、聊天/任务回答章节索引、精确跳转和动态布局避让。
 // @author       kdazhy
 // @match        https://chatgpt.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '6.3.0';
+  const VERSION = '6.4.0';
   const INSTALL_KEY = '__codexPlusChatConversationNavigator';
   const LOCK_ID = 'cgpt-codex-navigator-lock';
   const HOST_ID = 'cgpt-codex-navigator-v6-host';
@@ -43,8 +43,13 @@
     chapterTitleMaxChars: 70,
     fallbackChapterMinChars: 700,
     fallbackChapterMinHeight: 720,
-    fallbackChapterGapPx: 520,
+    fallbackChapterMaxChars: 96,
+    fallbackChapterLabelMaxChars: 44,
+    fallbackChapterMinGapPx: 28,
     fallbackChapterMaxCount: 12,
+    chapterMinVisibleCount: 3,
+    chapterMinAnswerChars: 700,
+    chapterMinAnswerHeight: 720,
     readingAnchorRatio: 0.30,
     scanDebounceMs: 180,
     scanIdleTimeoutMs: 260,
@@ -137,8 +142,14 @@
     activeIndex: -1,
     hoverIndex: -1,
     chapters: [],
+    chapterRows: [],
     activeChapterIndex: -1,
     hoverChapterIndex: -1,
+    chapterVisualActiveIndex: -2,
+    chapterVisualHoverIndex: -2,
+    chapterMetrics: null,
+    viewportMetrics: null,
+    viewportMetricsDirty: true,
     conversationRoot: null,
     scrollRoot: null,
 
@@ -338,6 +349,55 @@
     return rect.width > 2 && rect.height > 2;
   }
 
+  function isNumberedChapterTitle(text) {
+    return /^(?:第\s*[0-9一二三四五六七八九十百千万]+\s*(?:章|节|部分|步|阶段)(?=$|[\s:：.。、-])|[一二三四五六七八九十百千万]+[、.．。]\s*|[（(]\s*[一二三四五六七八九十百千万0-9]+\s*[）)]\s*|[0-9]{1,3}\s*[.)、．:：]\s*)/.test(text);
+  }
+
+  function isStandaloneEmphasis(node, text) {
+    const children = [...(node.children || [])].filter(child => !child.matches('br'));
+    const emphasis = children.filter(child => child.matches('strong, b, em, i, mark'));
+    if (children.length !== 1 || emphasis.length !== 1) return false;
+
+    const emphasisText = oneLine(emphasis[0].innerText || emphasis[0].textContent || '');
+    return Boolean(emphasisText) && emphasisText === text;
+  }
+
+  function isStandaloneChapterLabel(text) {
+    return (
+      text.length <= CONFIG.fallbackChapterLabelMaxChars &&
+      /[:：]$/.test(text) &&
+      !/[。！？.!?]/.test(text.slice(0, -1)) &&
+      !/[，,]/.test(text.slice(0, -1))
+    );
+  }
+
+  function isFallbackChapterCandidate(node) {
+    if (!isVisibleChapterTarget(node)) return false;
+
+    const tagName = node.tagName?.toUpperCase();
+    if (
+      !['P', 'DIV'].includes(tagName) ||
+      node.matches('blockquote, ul, ol, pre, table, code') ||
+      node.closest('blockquote, ul, ol, pre, table, code')
+    ) {
+      return false;
+    }
+
+    const text = oneLine(node.innerText || node.textContent || '');
+    if (
+      text.length < 3 ||
+      text.length > CONFIG.fallbackChapterMaxChars
+    ) {
+      return false;
+    }
+
+    return (
+      isNumberedChapterTitle(text) ||
+      isStandaloneEmphasis(node, text) ||
+      isStandaloneChapterLabel(text)
+    );
+  }
+
   function toChapter(target, level = 2, synthetic = false) {
     const fullText = oneLine(target.innerText || target.textContent || '');
     return {
@@ -361,21 +421,14 @@
 
     const candidates = [...root.querySelectorAll([
       ':scope > p',
-      ':scope > blockquote',
-      ':scope > ul',
-      ':scope > ol',
-      ':scope > pre',
-      ':scope > table',
       ':scope > div',
-    ].join(','))]
-      .filter(isVisibleChapterTarget)
-      .filter(node => oneLine(node.innerText || node.textContent || '').length >= 12);
+    ].join(','))].filter(isFallbackChapterCandidate);
 
     const chapters = [];
     let lastTop = -Infinity;
     for (const candidate of candidates) {
       const top = candidate.getBoundingClientRect().top;
-      if (chapters.length && top - lastTop < CONFIG.fallbackChapterGapPx) continue;
+      if (chapters.length && top - lastTop < CONFIG.fallbackChapterMinGapPx) continue;
       chapters.push(toChapter(candidate, chapters.length ? 3 : 2, true));
       lastTop = top;
       if (chapters.length >= CONFIG.fallbackChapterMaxCount) break;
@@ -388,14 +441,30 @@
     const root = item?.assistantRoot;
     if (!root?.isConnected) return [];
 
+    const rootText = oneLine(root.innerText || root.textContent || '');
+    const rootRect = root.getBoundingClientRect();
+    if (
+      rootText.length < CONFIG.chapterMinAnswerChars &&
+      rootRect.height < CONFIG.chapterMinAnswerHeight
+    ) {
+      return [];
+    }
+
     const semanticChapters = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6')]
       .filter(isVisibleChapterTarget)
       .map(heading => toChapter(heading, getHeadingLevel(heading)))
       .filter(chapter => chapter.fullText);
 
-    return semanticChapters.length
-      ? semanticChapters
-      : buildFallbackChapters(root);
+    if (semanticChapters.length) {
+      return semanticChapters.length >= CONFIG.chapterMinVisibleCount
+        ? semanticChapters
+        : [];
+    }
+
+    const fallbackChapters = buildFallbackChapters(root);
+    return fallbackChapters.length >= CONFIG.chapterMinVisibleCount
+      ? fallbackChapters
+      : [];
   }
 
   function findScrollRoot(node) {
@@ -414,15 +483,58 @@
   }
 
   function getViewportMetrics() {
+    if (state.viewportMetrics && !state.viewportMetricsDirty) {
+      return state.viewportMetrics;
+    }
+
     const root = state.scrollRoot;
     if (!root || root === document.body || root === document.documentElement || root === document.scrollingElement) {
-      return { top: 0, bottom: window.innerHeight, height: window.innerHeight };
+      state.viewportMetrics = {
+        top: 0,
+        bottom: window.innerHeight,
+        height: window.innerHeight,
+      };
+      state.viewportMetricsDirty = false;
+      return state.viewportMetrics;
     }
 
     const rect = root.getBoundingClientRect();
     const top = Math.max(0, rect.top);
     const bottom = Math.min(window.innerHeight, rect.bottom);
-    return { top, bottom, height: Math.max(1, bottom - top) };
+    state.viewportMetrics = {
+      top,
+      bottom,
+      height: Math.max(1, bottom - top),
+    };
+    state.viewportMetricsDirty = false;
+    return state.viewportMetrics;
+  }
+
+  function getScrollOffset(root = state.scrollRoot) {
+    if (!root || root === document.body || root === document.documentElement || root === document.scrollingElement) {
+      return document.scrollingElement?.scrollTop || window.scrollY || 0;
+    }
+    return root.scrollTop || 0;
+  }
+
+  function captureChapterMetrics() {
+    if (!state.chapters.length || !state.scrollRoot) {
+      state.chapterMetrics = null;
+      return;
+    }
+
+    const tops = state.chapters.map(chapter => {
+      const heading = chapter.heading;
+      return heading?.isConnected
+        ? heading.getBoundingClientRect().top
+        : null;
+    });
+
+    state.chapterMetrics = {
+      root: state.scrollRoot,
+      scrollTop: getScrollOffset(),
+      tops,
+    };
   }
 
   function getRouteKey() {
@@ -634,6 +746,8 @@
           padding: 0;
           overflow-x: hidden;
           overflow-y: auto;
+          contain: layout paint;
+          will-change: scroll-position;
           overscroll-behavior: contain;
           scrollbar-width: none;
         }
@@ -1158,12 +1272,25 @@
     if (!state.chapters.length) return -1;
 
     const anchorY = getReadingAnchorY();
+    const metrics = state.chapterMetrics;
+    if (
+      !metrics ||
+      metrics.root !== state.scrollRoot ||
+      metrics.tops.length !== state.chapters.length
+    ) {
+      captureChapterMetrics();
+    }
+
+    const chapterMetrics = state.chapterMetrics;
+    const scrollDelta = chapterMetrics
+      ? getScrollOffset() - chapterMetrics.scrollTop
+      : 0;
     let active = 0;
 
     for (let index = 0; index < state.chapters.length; index += 1) {
-      const heading = state.chapters[index].heading;
-      if (!heading?.isConnected) continue;
-      if (heading.getBoundingClientRect().top <= anchorY) active = index;
+      const top = chapterMetrics?.tops[index];
+      if (top == null) continue;
+      if (top - scrollDelta <= anchorY) active = index;
       else break;
     }
 
@@ -1182,11 +1309,13 @@
       );
 
     state.chapters = nextChapters;
+    state.chapterMetrics = null;
     state.activeChapterIndex = getActiveChapterIndexFromViewport();
 
     if (changed || forceRender) renderChapters();
     else updateChapterVisualState(false);
 
+    captureChapterMetrics();
     updateChapterPosition();
   }
 
@@ -1196,11 +1325,17 @@
     const item = state.items[state.activeIndex];
     const count = state.chapters.length;
     state.chapterShell.dataset.empty = String(count === 0);
+    state.chapterRows = [];
+    state.chapterVisualActiveIndex = -2;
+    state.chapterVisualHoverIndex = -2;
     state.chapterBody.replaceChildren();
     state.chapterCount.textContent = `${count} 章`;
     state.chapterContext.textContent = item ? truncate(item.fullText, 30) : '';
 
-    if (!count) return;
+    if (!count) {
+      state.chapterMetrics = null;
+      return;
+    }
 
     const fragment = document.createDocumentFragment();
     state.chapters.forEach((chapter, index) => {
@@ -1237,6 +1372,7 @@
         updateChapterVisualState(true);
       });
       row.addEventListener('click', () => scrollToChapter(index));
+      state.chapterRows.push(row);
       fragment.appendChild(row);
     });
 
@@ -1247,8 +1383,26 @@
   function updateChapterVisualState(scrollHoveredRow = false) {
     if (!state.shadow) return;
 
-    state.shadow.querySelectorAll('#chapter-body .nav-row').forEach(row => {
-      const index = Number(row.dataset.index);
+    const previousActive = state.chapterVisualActiveIndex;
+    const previousHover = state.chapterVisualHoverIndex;
+    const affected = new Set([
+      previousActive,
+      state.activeChapterIndex,
+      previousHover,
+      state.hoverChapterIndex,
+    ]);
+
+    for (const hoverIndex of [previousHover, state.hoverChapterIndex]) {
+      if (hoverIndex < 0) continue;
+      affected.add(hoverIndex - 2);
+      affected.add(hoverIndex - 1);
+      affected.add(hoverIndex + 1);
+      affected.add(hoverIndex + 2);
+    }
+
+    for (const index of affected) {
+      const row = state.chapterRows[index];
+      if (!row) continue;
       const distance = state.hoverChapterIndex >= 0
         ? Math.abs(index - state.hoverChapterIndex)
         : Infinity;
@@ -1257,12 +1411,14 @@
       row.classList.toggle('row-hover', index === state.hoverChapterIndex);
       row.classList.toggle('near-1', distance === 1);
       row.classList.toggle('near-2', distance === 2);
-    });
+    }
+
+    state.chapterVisualActiveIndex = state.activeChapterIndex;
+    state.chapterVisualHoverIndex = state.hoverChapterIndex;
 
     if (scrollHoveredRow && state.hoverChapterIndex >= 0) {
       requestAnimationFrame(() => {
-        state.shadow
-          .querySelector(`#chapter-body .nav-row[data-index="${state.hoverChapterIndex}"]`)
+        state.chapterRows[state.hoverChapterIndex]
           ?.scrollIntoView({ block: 'nearest' });
       });
     }
@@ -1368,6 +1524,8 @@
     if (typeof ResizeObserver !== 'function') return;
 
     state.resizeObserver = new ResizeObserver(() => {
+      state.viewportMetricsDirty = true;
+      state.chapterMetrics = null;
       scheduleChapterPositionBurst();
     });
 
@@ -1598,9 +1756,14 @@
       );
 
     state.conversationRoot = conversationRoot;
-    state.scrollRoot = findScrollRoot(
+    const nextScrollRoot = findScrollRoot(
       nextItems.find(item => item.target?.isConnected)?.target || conversationRoot
     );
+    if (nextScrollRoot !== state.scrollRoot) {
+      state.viewportMetricsDirty = true;
+      state.chapterMetrics = null;
+    }
+    state.scrollRoot = nextScrollRoot;
     state.items = nextItems;
 
     if (changed || uiRecreated) render();
@@ -1730,8 +1893,9 @@
     });
   }
 
-  function onAnyScroll() {
+  function onAnyScroll(event) {
     if (state.destroyed) return;
+    if (event?.composedPath?.().includes(state.host)) return;
     if (state.scrollRAF) return;
 
     state.scrollRAF = requestAnimationFrame(() => {
@@ -1742,11 +1906,12 @@
         state.activeChapterIndex = chapterIndex;
         updateChapterVisualState(false);
       }
-      updateChapterPosition();
     });
   }
 
   function onResize() {
+    state.viewportMetricsDirty = true;
+    state.chapterMetrics = null;
     onAnyScroll();
     observeLayout();
     scheduleChapterPositionBurst();
@@ -1816,8 +1981,13 @@
       state.activeIndex = -1;
       state.hoverIndex = -1;
       state.chapters = [];
+      state.chapterRows = [];
       state.activeChapterIndex = -1;
       state.hoverChapterIndex = -1;
+      state.chapterMetrics = null;
+      state.viewportMetricsDirty = true;
+      state.chapterVisualActiveIndex = -2;
+      state.chapterVisualHoverIndex = -2;
       state.lastChapterRight = null;
 
       render();
