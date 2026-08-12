@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话双侧导航与预览（Codex++）
 // @namespace    https://github.com/kdazhy
-// @version      6.2.0
-// @description  为 ChatGPT Windows 桌面端提供会话提问索引、当前回答章节索引、精确跳转和动态布局避让。
+// @version      6.3.0
+// @description  为 ChatGPT Windows 桌面端提供完整会话提问索引、聊天/任务回答章节索引、精确跳转和动态布局避让。
 // @author       kdazhy
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '6.2.0';
+  const VERSION = '6.3.0';
   const INSTALL_KEY = '__codexPlusChatConversationNavigator';
   const LOCK_ID = 'cgpt-codex-navigator-lock';
   const HOST_ID = 'cgpt-codex-navigator-v6-host';
@@ -41,8 +41,13 @@
 
     titleMaxChars: 72,
     chapterTitleMaxChars: 70,
+    fallbackChapterMinChars: 700,
+    fallbackChapterMinHeight: 720,
+    fallbackChapterGapPx: 520,
+    fallbackChapterMaxCount: 12,
     readingAnchorRatio: 0.30,
     scanDebounceMs: 180,
+    scanIdleTimeoutMs: 260,
     routePollMs: 900,
     jumpCorrectionMs: 650,
     layoutPollMs: 120,
@@ -128,6 +133,7 @@
     chapterContext: null,
 
     items: [],
+    previewCache: new Map(),
     activeIndex: -1,
     hoverIndex: -1,
     chapters: [],
@@ -138,8 +144,11 @@
 
     currentRouteKey: '',
     destroyed: false,
+    scanCount: 0,
     scanTimer: null,
+    scanIdleHandle: null,
     lateScanTimer: null,
+    navigationScanTimer: null,
     jumpCorrectionTimer: null,
     scrollRAF: null,
     mutationObserver: null,
@@ -231,6 +240,26 @@
     );
   }
 
+  // “任务”消息通常有独立 user anchor；“聊天”fallback turn 会把问答放在同一 turn。
+  // 回答关联必须使用更窄的用户单元，不能复用可能包住整轮回答的跳转目标。
+  function getMessageBoundary(messageNode) {
+    return (
+      messageNode.closest('[data-local-conversation-user-anchor]') ||
+      messageNode.closest('[data-content-search-unit-key]') ||
+      messageNode.closest('[data-testid="user-message"]') ||
+      messageNode.closest('[data-message-id]') ||
+      messageNode
+    );
+  }
+
+  function getNavigationId(messageNode, boundary, target) {
+    for (const node of [boundary, messageNode, target]) {
+      const id = node?.getAttribute?.('data-content-search-unit-key');
+      if (id) return id;
+    }
+    return '';
+  }
+
   function extractMessageText(node) {
     const preferred =
       node.querySelector('.whitespace-pre-wrap') ||
@@ -296,32 +325,77 @@
     return match ? Number(match[1]) : 2;
   }
 
+  function isVisibleChapterTarget(node) {
+    if (
+      !node?.isConnected ||
+      node.matches?.('.sr-only, [aria-hidden="true"]') ||
+      node.closest?.('[data-user-message-bubble], [data-local-conversation-user-anchor]')
+    ) {
+      return false;
+    }
+
+    const rect = node.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  }
+
+  function toChapter(target, level = 2, synthetic = false) {
+    const fullText = oneLine(target.innerText || target.textContent || '');
+    return {
+      heading: target,
+      level,
+      synthetic,
+      fullText,
+      title: truncate(fullText, CONFIG.chapterTitleMaxChars),
+    };
+  }
+
+  function buildFallbackChapters(root) {
+    const rootRect = root.getBoundingClientRect();
+    const rootText = oneLine(root.innerText || root.textContent || '');
+    if (
+      rootText.length < CONFIG.fallbackChapterMinChars &&
+      rootRect.height < CONFIG.fallbackChapterMinHeight
+    ) {
+      return [];
+    }
+
+    const candidates = [...root.querySelectorAll([
+      ':scope > p',
+      ':scope > blockquote',
+      ':scope > ul',
+      ':scope > ol',
+      ':scope > pre',
+      ':scope > table',
+      ':scope > div',
+    ].join(','))]
+      .filter(isVisibleChapterTarget)
+      .filter(node => oneLine(node.innerText || node.textContent || '').length >= 12);
+
+    const chapters = [];
+    let lastTop = -Infinity;
+    for (const candidate of candidates) {
+      const top = candidate.getBoundingClientRect().top;
+      if (chapters.length && top - lastTop < CONFIG.fallbackChapterGapPx) continue;
+      chapters.push(toChapter(candidate, chapters.length ? 3 : 2, true));
+      lastTop = top;
+      if (chapters.length >= CONFIG.fallbackChapterMaxCount) break;
+    }
+
+    return chapters.filter(chapter => chapter.fullText);
+  }
+
   function buildChapterModel(item) {
     const root = item?.assistantRoot;
     if (!root?.isConnected) return [];
 
-    return [...root.querySelectorAll('h1, h2, h3, h4, h5, h6')]
-      .filter(heading => {
-        if (
-          heading.matches('.sr-only, [aria-hidden="true"]') ||
-          heading.closest('[data-user-message-bubble], [data-local-conversation-user-anchor]')
-        ) {
-          return false;
-        }
-
-        const rect = heading.getBoundingClientRect();
-        return rect.width > 2 && rect.height > 2;
-      })
-      .map(heading => {
-        const fullText = oneLine(heading.innerText || heading.textContent || '');
-        return {
-          heading,
-          level: getHeadingLevel(heading),
-          fullText,
-          title: truncate(fullText, CONFIG.chapterTitleMaxChars),
-        };
-      })
+    const semanticChapters = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+      .filter(isVisibleChapterTarget)
+      .map(heading => toChapter(heading, getHeadingLevel(heading)))
       .filter(chapter => chapter.fullText);
+
+    return semanticChapters.length
+      ? semanticChapters
+      : buildFallbackChapters(root);
   }
 
   function findScrollRoot(node) {
@@ -691,6 +765,16 @@
           line-height: 1.35;
         }
 
+        #body .nav-row[data-loaded="false"] .nav-title,
+        #body .nav-row[data-preview-known="false"] .nav-num {
+          opacity: .48;
+        }
+
+        #body .nav-row[data-loaded="false"]:not(.row-active):not(.row-hover) .nav-line {
+          width: 5px;
+          opacity: .42;
+        }
+
         .nav-line-cell {
           position: relative;
           align-self: stretch;
@@ -877,6 +961,72 @@
   // 6. 严格一对一渲染
   // =========================================================
 
+  function getNativeNavigationEntries() {
+    const seen = new Set();
+    return [...document.querySelectorAll('[data-thread-user-message-navigation-item-id]')]
+      .map((control, index) => ({
+        control,
+        index,
+        navigationId: control.getAttribute('data-thread-user-message-navigation-item-id') || '',
+      }))
+      .filter(entry => {
+        if (!entry.navigationId || seen.has(entry.navigationId)) return false;
+        seen.add(entry.navigationId);
+        return true;
+      });
+  }
+
+  function mergeWithNativeNavigation(loadedItems) {
+    const nativeEntries = getNativeNavigationEntries();
+    if (!nativeEntries.length) return loadedItems;
+
+    const loadedById = new Map();
+    for (const item of loadedItems) {
+      if (!item.navigationId) continue;
+      loadedById.set(item.navigationId, item);
+      state.previewCache.set(item.navigationId, {
+        fullText: item.fullText,
+        title: item.title,
+      });
+    }
+
+    const used = new Set();
+    const merged = nativeEntries.map((entry, index) => {
+      const loaded = loadedById.get(entry.navigationId);
+      if (loaded) {
+        used.add(loaded);
+        return {
+          ...loaded,
+          nativeControl: entry.control,
+          loaded: true,
+          previewKnown: true,
+        };
+      }
+
+      const cached = state.previewCache.get(entry.navigationId);
+      const placeholder = `第 ${index + 1} 个提问（点击载入预览）`;
+      return {
+        node: null,
+        target: null,
+        boundary: null,
+        assistantRoot: null,
+        navigationId: entry.navigationId,
+        nativeControl: entry.control,
+        loaded: false,
+        previewKnown: Boolean(cached),
+        fullText: cached?.fullText || placeholder,
+        title: cached?.title || placeholder,
+      };
+    });
+
+    // 旧网页结构或 fallback chat 可能没有对应原生控件，仍保留已识别的真实消息。
+    for (const item of loadedItems) {
+      if (!used.has(item)) merged.push(item);
+    }
+
+    return merged;
+  }
+
   function render() {
     if (!state.shell || !state.body) return;
 
@@ -901,6 +1051,9 @@
       row.type = 'button';
       row.className = 'nav-row';
       row.dataset.index = String(index);
+      row.dataset.navigationId = item.navigationId || '';
+      row.dataset.loaded = String(item.loaded !== false);
+      row.dataset.previewKnown = String(item.previewKnown !== false);
       row.title = item.fullText;
       row.setAttribute('aria-label', `${index + 1}. ${item.title}`);
       row.style.setProperty('--entry-delay', `${Math.min(index, 12) * 12}ms`);
@@ -1230,7 +1383,9 @@
   // =========================================================
 
   function getNativeNavigationControl(item) {
-    const navigationId = item?.target?.getAttribute?.('data-content-search-unit-key');
+    if (item?.nativeControl?.isConnected) return item.nativeControl;
+
+    const navigationId = item?.navigationId;
     if (!navigationId) return null;
 
     return [...document.querySelectorAll('[data-thread-user-message-navigation-item-id]')]
@@ -1255,36 +1410,51 @@
 
   function scrollToItem(index) {
     const item = state.items[index];
+    const nativeControl = getNativeNavigationControl(item);
 
-    if (!item?.target?.isConnected) {
+    if (!item || (!item.target?.isConnected && !nativeControl?.isConnected)) {
       scheduleScan();
       return;
     }
 
     clearTimeout(state.jumpCorrectionTimer);
+    clearTimeout(state.navigationScanTimer);
 
-    const nativeControl = getNativeNavigationControl(item);
     if (nativeControl?.isConnected) {
       nativeControl.click();
     } else {
       alignItemToStart(item, CONFIG.smoothScroll ? 'smooth' : 'auto');
     }
 
+    setActive(index);
+
+    // 未挂载的虚拟历史项交给 Codex 原生控件载入；随后只做两次低频重扫和一次落点校准。
+    if (!item.target?.isConnected) {
+      scheduleScan(80);
+      state.navigationScanTimer = setTimeout(() => {
+        state.navigationScanTimer = null;
+        scheduleScan(0);
+      }, 520);
+    }
+
     // 平滑滚动期间内容高度可能继续变化；结束后用用户消息锚点再校准一次。
     state.jumpCorrectionTimer = setTimeout(() => {
-      if (!item.target?.isConnected) return;
+      const currentItem = item.navigationId
+        ? state.items.find(candidate => candidate.navigationId === item.navigationId)
+        : item;
+      if (!currentItem?.target?.isConnected) return;
 
       const viewport = getViewportMetrics();
-      const rect = item.target.getBoundingClientRect();
-      const scrollMarginTop = Number.parseFloat(getComputedStyle(item.target).scrollMarginTop) || 0;
+      const rect = currentItem.target.getBoundingClientRect();
+      const scrollMarginTop = Number.parseFloat(
+        getComputedStyle(currentItem.target).scrollMarginTop
+      ) || 0;
       const expectedTop = viewport.top + scrollMarginTop;
 
       if (Math.abs(rect.top - expectedTop) > 6) {
-        alignItemToStart(item, 'auto');
+        alignItemToStart(currentItem, 'auto');
       }
     }, CONFIG.jumpCorrectionMs);
-
-    setActive(index);
   }
 
   function scrollToChapter(index) {
@@ -1340,7 +1510,11 @@
     }
 
     const anchorY = getReadingAnchorY();
-    let activeIndex = 0;
+    let activeIndex = state.items.findIndex(item => item.target?.isConnected);
+    if (activeIndex < 0) {
+      updateVisualState(false);
+      return;
+    }
 
     for (let index = 0; index < state.items.length; index += 1) {
       const target = state.items[index].target;
@@ -1367,6 +1541,7 @@
 
   function scanMessages() {
     if (state.destroyed) return;
+    state.scanCount += 1;
 
     const previousActiveRoot = state.items[state.activeIndex]?.assistantRoot || null;
 
@@ -1378,43 +1553,54 @@
 
     const conversationRoot = getConversationRoot();
     const nodes = getUserMessageNodes(conversationRoot);
-    const seenTargets = new Set();
-    const nextItems = [];
+    const seenBoundaries = new Set();
+    const loadedItems = [];
 
     for (const node of nodes) {
       const target = getScrollTarget(node);
-      if (!target || seenTargets.has(target)) continue;
+      const boundary = getMessageBoundary(node);
+      if (!target || !boundary || seenBoundaries.has(boundary)) continue;
 
       const fullText = extractMessageText(node);
       if (!fullText) continue;
 
-      seenTargets.add(target);
+      seenBoundaries.add(boundary);
 
-      nextItems.push({
+      loadedItems.push({
         node,
         target,
+        boundary,
+        navigationId: getNavigationId(node, boundary, target),
+        loaded: true,
+        previewKnown: true,
         fullText,
         title: truncate(fullText),
       });
     }
 
-    nextItems.forEach((item, index) => {
+    loadedItems.forEach((item, index) => {
       item.assistantRoot = findAssistantRoot(
         conversationRoot,
-        item.target,
-        nextItems[index + 1]?.target || null
+        item.boundary,
+        loadedItems[index + 1]?.boundary || null
       );
     });
+
+    const nextItems = mergeWithNativeNavigation(loadedItems);
 
     const changed =
       nextItems.length !== state.items.length ||
       nextItems.some((item, i) =>
         item.target !== state.items[i]?.target ||
+        item.navigationId !== state.items[i]?.navigationId ||
+        item.loaded !== state.items[i]?.loaded ||
         item.fullText !== state.items[i]?.fullText
       );
 
     state.conversationRoot = conversationRoot;
-    state.scrollRoot = findScrollRoot(nextItems[0]?.target || conversationRoot);
+    state.scrollRoot = findScrollRoot(
+      nextItems.find(item => item.target?.isConnected)?.target || conversationRoot
+    );
     state.items = nextItems;
 
     if (changed || uiRecreated) render();
@@ -1432,29 +1618,87 @@
   function scheduleScan(delay = CONFIG.scanDebounceMs) {
     if (state.destroyed) return;
 
-    if (state.scanTimer) {
+    if (state.scanTimer || state.scanIdleHandle !== null) {
       if (delay > 0) return;
       clearTimeout(state.scanTimer);
+      if (state.scanIdleHandle !== null && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(state.scanIdleHandle);
+      }
+      state.scanIdleHandle = null;
     }
 
     state.scanTimer = setTimeout(() => {
       state.scanTimer = null;
-      scanMessages();
+      if (typeof requestIdleCallback === 'function') {
+        state.scanIdleHandle = requestIdleCallback(() => {
+          state.scanIdleHandle = null;
+          scanMessages();
+        }, { timeout: CONFIG.scanIdleTimeoutMs });
+      } else {
+        scanMessages();
+      }
     }, delay);
+  }
+
+  function nodeMatchesOrContains(node, selector) {
+    return node?.nodeType === Node.ELEMENT_NODE && (
+      node.matches(selector) || node.querySelector(selector)
+    );
   }
 
   function observeDOM() {
     state.mutationObserver?.disconnect();
 
     state.mutationObserver = new MutationObserver(mutations => {
-      scheduleScan();
+      const scanSelector = [
+        '[data-user-message-bubble]',
+        '[data-message-author-role="user"]',
+        '[data-testid="user-message"]',
+        '[data-message-role="user"]',
+        '[data-thread-user-message-navigation-item-id]',
+        '[data-markdown-text-style="assistant-message"]',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      ].join(',');
+
+      const needsScan = mutations.some(mutation => {
+        if (mutation.type === 'characterData') {
+          return Boolean(mutation.target.parentElement?.closest([
+            '[data-user-message-bubble]',
+            '[data-message-author-role="user"]',
+            '[data-testid="user-message"]',
+            '[data-message-role="user"]',
+            'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+          ].join(',')));
+        }
+
+        if (mutation.type === 'childList') {
+          return [...mutation.addedNodes, ...mutation.removedNodes]
+            .some(node => nodeMatchesOrContains(node, scanSelector));
+        }
+
+        if (mutation.type !== 'attributes') return false;
+        if (mutation.attributeName === 'aria-hidden') return true;
+        if (mutation.attributeName === 'class') {
+          return Boolean(mutation.target.closest?.([
+            '[data-user-message-bubble]',
+            '[data-markdown-text-style="assistant-message"] h1',
+            '[data-markdown-text-style="assistant-message"] h2',
+            '[data-markdown-text-style="assistant-message"] h3',
+            '[data-markdown-text-style="assistant-message"] h4',
+            '[data-markdown-text-style="assistant-message"] h5',
+            '[data-markdown-text-style="assistant-message"] h6',
+          ].join(',')));
+        }
+        return !['style', 'data-state'].includes(mutation.attributeName);
+      });
+      if (needsScan) scheduleScan();
 
       const layoutChanged = mutations.some(mutation =>
-        mutation.type === 'childList' ||
-        (
-          mutation.type === 'attributes' &&
-          ['class', 'style', 'data-state'].includes(mutation.attributeName)
-        )
+        mutation.type === 'attributes' &&
+        ['class', 'style', 'data-state'].includes(mutation.attributeName) &&
+        Boolean(mutation.target.closest?.(
+          'aside, nav[aria-label], main, [role="main"], [data-testid*="sidebar"]'
+        ))
       );
       if (layoutChanged) scheduleChapterPositionBurst();
     });
@@ -1568,6 +1812,7 @@
 
       state.currentRouteKey = nextRouteKey;
       state.items = [];
+      state.previewCache.clear();
       state.activeIndex = -1;
       state.hoverIndex = -1;
       state.chapters = [];
@@ -1619,10 +1864,14 @@
 
     clearTimeout(state.scanTimer);
     clearTimeout(state.lateScanTimer);
+    clearTimeout(state.navigationScanTimer);
     clearTimeout(state.jumpCorrectionTimer);
     clearTimeout(state.layoutTimer);
     clearInterval(state.routeTimer);
     if (state.scrollRAF) cancelAnimationFrame(state.scrollRAF);
+    if (state.scanIdleHandle !== null && typeof cancelIdleCallback === 'function') {
+      cancelIdleCallback(state.scanIdleHandle);
+    }
 
     state.mutationObserver?.disconnect();
     state.resizeObserver?.disconnect();
@@ -1648,6 +1897,12 @@
   const api = {
     version: VERSION,
     rescan: () => scheduleScan(0),
+    diagnostics: () => ({
+      scans: state.scanCount,
+      items: state.items.length,
+      loadedItems: state.items.filter(item => item.loaded !== false).length,
+      chapters: state.chapters.length,
+    }),
     destroy,
   };
 
