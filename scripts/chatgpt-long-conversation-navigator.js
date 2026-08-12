@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT 长对话导航与预览（Codex++）
+// @name         ChatGPT 长对话双侧导航与预览（Codex++）
 // @namespace    https://github.com/kdazhy
-// @version      6.1.1
-// @description  为 ChatGPT Windows 桌面端长对话提供提问索引、悬浮预览、精确跳转和快捷键导航。
+// @version      6.2.0
+// @description  为 ChatGPT Windows 桌面端提供会话提问索引、当前回答章节索引、精确跳转和动态布局避让。
 // @author       kdazhy
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '6.1.1';
+  const VERSION = '6.2.0';
   const INSTALL_KEY = '__codexPlusChatConversationNavigator';
   const LOCK_ID = 'cgpt-codex-navigator-lock';
   const HOST_ID = 'cgpt-codex-navigator-v6-host';
@@ -23,6 +23,10 @@
     right: 10,
     collapsedWidth: 54,
     expandedWidth: 430,
+    chapterCollapsedWidth: 52,
+    chapterExpandedWidth: 350,
+    chapterGapFromAnswer: 16,
+    chapterObstructionGap: 8,
     rowHeight: 38,
     maxShellHeightRatio: 0.72,
 
@@ -36,9 +40,13 @@
     smoothScroll: true,
 
     titleMaxChars: 72,
+    chapterTitleMaxChars: 70,
+    readingAnchorRatio: 0.30,
     scanDebounceMs: 180,
     routePollMs: 900,
     jumpCorrectionMs: 650,
+    layoutPollMs: 120,
+    layoutSettleMs: 720,
   };
 
   // =========================================================
@@ -114,10 +122,17 @@
     shell: null,
     body: null,
     count: null,
+    chapterShell: null,
+    chapterBody: null,
+    chapterCount: null,
+    chapterContext: null,
 
     items: [],
     activeIndex: -1,
     hoverIndex: -1,
+    chapters: [],
+    activeChapterIndex: -1,
+    hoverChapterIndex: -1,
     conversationRoot: null,
     scrollRoot: null,
 
@@ -128,6 +143,10 @@
     jumpCorrectionTimer: null,
     scrollRAF: null,
     mutationObserver: null,
+    resizeObserver: null,
+    layoutTimer: null,
+    layoutBurstUntil: 0,
+    lastChapterRight: null,
     routeTimer: null,
     domReadyHandler: null,
     initialized: false,
@@ -233,6 +252,78 @@
     return attachmentCount ? `附件消息（${attachmentCount} 个附件）` : '';
   }
 
+  function isNodeBetween(node, start, end) {
+    if (!node?.isConnected || !start?.isConnected || start.contains(node)) return false;
+
+    const afterStart = Boolean(
+      start.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING
+    );
+    if (!afterStart) return false;
+
+    return !end || Boolean(
+      node.compareDocumentPosition(end) & Node.DOCUMENT_POSITION_FOLLOWING
+    );
+  }
+
+  function findAssistantRoot(conversationRoot, start, end) {
+    if (!conversationRoot || !start) return null;
+
+    const selectorGroups = [
+      '[data-markdown-text-style="assistant-message"]',
+      '[data-message-author-role="assistant"] .markdown, [data-message-author-role="assistant"] [class*="markdown"]',
+      '.markdown, [class*="MarkdownRoot"]',
+    ];
+
+    for (const selector of selectorGroups) {
+      const candidate = [...conversationRoot.querySelectorAll(selector)]
+        .find(node =>
+          !node.closest('[data-user-message-bubble], [data-local-conversation-user-anchor]') &&
+          isNodeBetween(node, start, end)
+        );
+      if (candidate) return candidate;
+    }
+
+    return [...conversationRoot.querySelectorAll('[data-content-search-unit-key]')]
+      .find(unit => {
+        if (!isNodeBetween(unit, start, end)) return false;
+        return [...unit.querySelectorAll('h4.sr-only')]
+          .some(label => /ChatGPT\s*说|assistant/i.test(label.textContent || ''));
+      }) || null;
+  }
+
+  function getHeadingLevel(heading) {
+    const match = heading?.tagName?.match(/^H([1-6])$/i);
+    return match ? Number(match[1]) : 2;
+  }
+
+  function buildChapterModel(item) {
+    const root = item?.assistantRoot;
+    if (!root?.isConnected) return [];
+
+    return [...root.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+      .filter(heading => {
+        if (
+          heading.matches('.sr-only, [aria-hidden="true"]') ||
+          heading.closest('[data-user-message-bubble], [data-local-conversation-user-anchor]')
+        ) {
+          return false;
+        }
+
+        const rect = heading.getBoundingClientRect();
+        return rect.width > 2 && rect.height > 2;
+      })
+      .map(heading => {
+        const fullText = oneLine(heading.innerText || heading.textContent || '');
+        return {
+          heading,
+          level: getHeadingLevel(heading),
+          fullText,
+          title: truncate(fullText, CONFIG.chapterTitleMaxChars),
+        };
+      })
+      .filter(chapter => chapter.fullText);
+  }
+
   function findScrollRoot(node) {
     let current = node?.parentElement || null;
 
@@ -310,8 +401,8 @@
           opacity: .5;
         }
 
-        /* v6.1：参考 rewrite v1.1 的单 shell / 单行模型。 */
-        #shell {
+        /* v6.2：右侧会话 + 左侧当前回答，共用单行精密导航语言。 */
+        .nav-shell {
           position: fixed;
           right: ${CONFIG.right}px;
           top: 50%;
@@ -344,17 +435,19 @@
 
           transition:
             width ${CONFIG.animationMs}ms cubic-bezier(.2,.8,.2,1),
+            right ${CONFIG.animationMs}ms cubic-bezier(.2,.8,.2,1),
             background-color ${CONFIG.animationMs}ms ease,
             border-color ${CONFIG.animationMs}ms ease,
             box-shadow ${CONFIG.animationMs}ms ease;
         }
 
-        #shell[data-empty="true"] {
+        .nav-shell[data-empty="true"],
+        .nav-shell[data-constrained="true"] {
           display: none;
         }
 
-        #shell:hover,
-        #shell:focus-within {
+        .nav-shell:hover,
+        .nav-shell:focus-within {
           width: min(${CONFIG.expandedWidth}px, calc(100vw - 20px));
           border-color: color-mix(in srgb, CanvasText 11%, transparent);
           background:
@@ -371,7 +464,7 @@
           -webkit-backdrop-filter: blur(18px) saturate(1.15);
         }
 
-        #header {
+        .nav-header {
           flex: 0 0 auto;
           min-height: 0;
           height: 0;
@@ -398,8 +491,8 @@
             box-shadow ${CONFIG.animationMs}ms ease;
         }
 
-        #shell:hover #header,
-        #shell:focus-within #header {
+        .nav-shell:hover .nav-header,
+        .nav-shell:focus-within .nav-header {
           min-height: 48px;
           height: 48px;
           box-shadow: inset 0 -1px 0 color-mix(in srgb, CanvasText 8%, transparent);
@@ -462,7 +555,7 @@
           opacity: .6;
         }
 
-        #body {
+        .nav-body {
           min-height: 0;
           padding: 0;
           overflow-x: hidden;
@@ -471,20 +564,20 @@
           scrollbar-width: none;
         }
 
-        #body::-webkit-scrollbar { width: 0; height: 0; }
+        .nav-body::-webkit-scrollbar { width: 0; height: 0; }
 
-        #shell:hover #body,
-        #shell:focus-within #body {
+        .nav-shell:hover .nav-body,
+        .nav-shell:focus-within .nav-body {
           padding: 7px;
           scrollbar-width: thin;
           scrollbar-color: color-mix(in srgb, CanvasText 18%, transparent) transparent;
         }
 
-        #shell:hover #body::-webkit-scrollbar,
-        #shell:focus-within #body::-webkit-scrollbar { width: 6px; }
+        .nav-shell:hover .nav-body::-webkit-scrollbar,
+        .nav-shell:focus-within .nav-body::-webkit-scrollbar { width: 6px; }
 
-        #shell:hover #body::-webkit-scrollbar-thumb,
-        #shell:focus-within #body::-webkit-scrollbar-thumb {
+        .nav-shell:hover .nav-body::-webkit-scrollbar-thumb,
+        .nav-shell:focus-within .nav-body::-webkit-scrollbar-thumb {
           border: 2px solid transparent;
           border-radius: 999px;
           background: color-mix(in srgb, CanvasText 20%, transparent);
@@ -524,8 +617,8 @@
             transform 120ms cubic-bezier(.2,.8,.2,1);
         }
 
-        #shell:hover .nav-row,
-        #shell:focus-within .nav-row {
+        .nav-shell:hover .nav-row,
+        .nav-shell:focus-within .nav-row {
           padding-left: 9px;
         }
 
@@ -559,8 +652,8 @@
             visibility 120ms step-end;
         }
 
-        #shell:hover .nav-title-wrap,
-        #shell:focus-within .nav-title-wrap {
+        .nav-shell:hover .nav-title-wrap,
+        .nav-shell:focus-within .nav-title-wrap {
           opacity: 1;
           visibility: visible;
           transform: translateX(0);
@@ -571,7 +664,7 @@
             visibility 0s;
         }
 
-        #shell:not(:hover):not(:focus-within) .nav-title-wrap {
+        .nav-shell:not(:hover):not(:focus-within) .nav-title-wrap {
           min-width: 0;
           overflow: hidden;
           pointer-events: none;
@@ -652,6 +745,56 @@
           box-shadow: none;
         }
 
+        #chapter-shell {
+          --chapter-available-width: ${CONFIG.chapterExpandedWidth}px;
+          container-type: inline-size;
+          width: ${CONFIG.chapterCollapsedWidth}px;
+          max-width: var(--chapter-available-width);
+          right: calc(100vw - ${CONFIG.chapterCollapsedWidth + 8}px);
+          transform-origin: right center;
+        }
+
+        #chapter-shell:hover,
+        #chapter-shell:focus-within {
+          width: min(${CONFIG.chapterExpandedWidth}px, var(--chapter-available-width));
+        }
+
+        #chapter-shell .nav-row {
+          grid-template-columns: minmax(0, 1fr) ${CONFIG.chapterCollapsedWidth - 2}px;
+        }
+
+        #chapter-shell .nav-line { right: 8px; }
+        #chapter-shell .nav-title-wrap { grid-template-columns: 31px minmax(0, 1fr); }
+
+        #chapter-context {
+          max-width: 188px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 10px;
+          opacity: .45;
+        }
+
+        #chapter-shell .brand-title { flex: 0 0 auto; }
+
+        @container (max-width: 310px) {
+          #chapter-context { display: none; }
+        }
+
+        #chapter-shell .nav-title.level-1,
+        #chapter-shell .nav-title.level-2 { font-weight: 640; }
+        #chapter-shell .nav-title.level-3 { padding-left: 9px; }
+        #chapter-shell .nav-title.level-4 { padding-left: 18px; opacity: .88; }
+        #chapter-shell .nav-title.level-5,
+        #chapter-shell .nav-title.level-6 { padding-left: 26px; opacity: .78; }
+
+        #chapter-shell .nav-row[data-level="1"]:not(.row-active):not(.row-hover) .nav-line { width: 15px; }
+        #chapter-shell .nav-row[data-level="2"]:not(.row-active):not(.row-hover) .nav-line { width: 11px; }
+        #chapter-shell .nav-row[data-level="3"]:not(.row-active):not(.row-hover) .nav-line { width: 8px; }
+        #chapter-shell .nav-row[data-level="4"]:not(.row-active):not(.row-hover) .nav-line,
+        #chapter-shell .nav-row[data-level="5"]:not(.row-active):not(.row-hover) .nav-line,
+        #chapter-shell .nav-row[data-level="6"]:not(.row-active):not(.row-hover) .nav-line { width: 6px; }
+
         @keyframes nav-row-in {
           from {
             opacity: 0;
@@ -660,8 +803,8 @@
         }
 
         @media (prefers-reduced-motion: reduce) {
-          #shell,
-          #header,
+          .nav-shell,
+          .nav-header,
           .nav-row,
           .nav-title-wrap,
           .nav-line {
@@ -671,15 +814,29 @@
         }
 
         @media (forced-colors: active) {
-          #shell:hover,
-          #shell:focus-within { border-color: CanvasText; }
+          .nav-shell:hover,
+          .nav-shell:focus-within { border-color: CanvasText; }
           .nav-row:focus-visible { outline: 2px solid Highlight; }
           .nav-line { background: CanvasText; }
         }
       </style>
 
-      <section id="shell" data-empty="true" aria-label="ChatGPT 会话导航">
-        <header id="header">
+      <section id="chapter-shell" class="nav-shell" data-empty="true" data-constrained="false" aria-label="当前回答章节导航">
+        <header id="chapter-header" class="nav-header">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span class="brand-title">回答章节</span>
+            <span id="chapter-context"></span>
+          </div>
+          <div class="meta">
+            <span id="chapter-count">0 章</span>
+          </div>
+        </header>
+        <div id="chapter-body" class="nav-body"></div>
+      </section>
+
+      <section id="shell" class="nav-shell" data-empty="true" aria-label="ChatGPT 会话导航">
+        <header id="header" class="nav-header">
           <div class="brand">
             <span class="brand-mark" aria-hidden="true"></span>
             <span class="brand-title">会话索引</span>
@@ -689,7 +846,7 @@
             <kbd>Alt ↑↓</kbd>
           </div>
         </header>
-        <div id="body"></div>
+        <div id="body" class="nav-body"></div>
       </section>
     `;
 
@@ -700,10 +857,19 @@
     state.shell = shadow.getElementById('shell');
     state.body = shadow.getElementById('body');
     state.count = shadow.getElementById('count');
+    state.chapterShell = shadow.getElementById('chapter-shell');
+    state.chapterBody = shadow.getElementById('chapter-body');
+    state.chapterCount = shadow.getElementById('chapter-count');
+    state.chapterContext = shadow.getElementById('chapter-context');
 
     state.shell.addEventListener('pointerleave', () => {
       state.hoverIndex = -1;
       updateVisualState(false);
+    });
+
+    state.chapterShell.addEventListener('pointerleave', () => {
+      state.hoverChapterIndex = -1;
+      updateChapterVisualState(false);
     });
   }
 
@@ -780,9 +946,9 @@
 
   function assertInvariant() {
     const itemCount = state.items.length;
-    const rowCount = state.shadow.querySelectorAll('.nav-row').length;
-    const lineCount = state.shadow.querySelectorAll('.nav-row > .nav-line-cell > .nav-line').length;
-    const titleCount = state.shadow.querySelectorAll('.nav-row > .nav-title-wrap > .nav-title').length;
+    const rowCount = state.shadow.querySelectorAll('#body .nav-row').length;
+    const lineCount = state.shadow.querySelectorAll('#body .nav-row > .nav-line-cell > .nav-line').length;
+    const titleCount = state.shadow.querySelectorAll('#body .nav-row > .nav-title-wrap > .nav-title').length;
 
     const ok =
       itemCount === rowCount &&
@@ -809,7 +975,7 @@
   function updateVisualState(scrollHoveredRow = false) {
     if (!state.shadow) return;
 
-    state.shadow.querySelectorAll('.nav-row').forEach(row => {
+    state.shadow.querySelectorAll('#body .nav-row').forEach(row => {
       const i = Number(row.dataset.index);
       const distance = state.hoverIndex >= 0
         ? Math.abs(i - state.hoverIndex)
@@ -824,9 +990,238 @@
     if (scrollHoveredRow && state.hoverIndex >= 0) {
       requestAnimationFrame(() => {
         state.shadow
-          .querySelector(`.nav-row[data-index="${state.hoverIndex}"]`)
+          .querySelector(`#body .nav-row[data-index="${state.hoverIndex}"]`)
           ?.scrollIntoView({ block: 'nearest' });
       });
+    }
+  }
+
+  function getReadingAnchorY() {
+    const viewport = getViewportMetrics();
+    return viewport.top + viewport.height * CONFIG.readingAnchorRatio;
+  }
+
+  function getActiveChapterIndexFromViewport() {
+    if (!state.chapters.length) return -1;
+
+    const anchorY = getReadingAnchorY();
+    let active = 0;
+
+    for (let index = 0; index < state.chapters.length; index += 1) {
+      const heading = state.chapters[index].heading;
+      if (!heading?.isConnected) continue;
+      if (heading.getBoundingClientRect().top <= anchorY) active = index;
+      else break;
+    }
+
+    return active;
+  }
+
+  function refreshChapters(forceRender = false) {
+    const item = state.items[state.activeIndex];
+    const nextChapters = buildChapterModel(item);
+    const changed =
+      nextChapters.length !== state.chapters.length ||
+      nextChapters.some((chapter, index) =>
+        chapter.heading !== state.chapters[index]?.heading ||
+        chapter.level !== state.chapters[index]?.level ||
+        chapter.fullText !== state.chapters[index]?.fullText
+      );
+
+    state.chapters = nextChapters;
+    state.activeChapterIndex = getActiveChapterIndexFromViewport();
+
+    if (changed || forceRender) renderChapters();
+    else updateChapterVisualState(false);
+
+    updateChapterPosition();
+  }
+
+  function renderChapters() {
+    if (!state.chapterShell || !state.chapterBody) return;
+
+    const item = state.items[state.activeIndex];
+    const count = state.chapters.length;
+    state.chapterShell.dataset.empty = String(count === 0);
+    state.chapterBody.replaceChildren();
+    state.chapterCount.textContent = `${count} 章`;
+    state.chapterContext.textContent = item ? truncate(item.fullText, 30) : '';
+
+    if (!count) return;
+
+    const fragment = document.createDocumentFragment();
+    state.chapters.forEach((chapter, index) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'nav-row';
+      row.dataset.index = String(index);
+      row.dataset.level = String(chapter.level);
+      row.title = chapter.fullText;
+      row.setAttribute('aria-label', `${index + 1}. ${chapter.title}`);
+      row.style.setProperty('--entry-delay', `${Math.min(index, 12) * 12}ms`);
+
+      const titleWrap = document.createElement('span');
+      titleWrap.className = 'nav-title-wrap';
+
+      const num = document.createElement('span');
+      num.className = 'nav-num';
+      num.textContent = String(index + 1).padStart(2, '0');
+
+      const title = document.createElement('span');
+      title.className = `nav-title level-${chapter.level}`;
+      title.textContent = chapter.title;
+      titleWrap.append(num, title);
+
+      const lineCell = document.createElement('span');
+      lineCell.className = 'nav-line-cell';
+      const line = document.createElement('span');
+      line.className = 'nav-line';
+      lineCell.appendChild(line);
+      row.append(titleWrap, lineCell);
+
+      row.addEventListener('pointerenter', () => {
+        state.hoverChapterIndex = index;
+        updateChapterVisualState(true);
+      });
+      row.addEventListener('click', () => scrollToChapter(index));
+      fragment.appendChild(row);
+    });
+
+    state.chapterBody.appendChild(fragment);
+    updateChapterVisualState(false);
+  }
+
+  function updateChapterVisualState(scrollHoveredRow = false) {
+    if (!state.shadow) return;
+
+    state.shadow.querySelectorAll('#chapter-body .nav-row').forEach(row => {
+      const index = Number(row.dataset.index);
+      const distance = state.hoverChapterIndex >= 0
+        ? Math.abs(index - state.hoverChapterIndex)
+        : Infinity;
+
+      row.classList.toggle('row-active', index === state.activeChapterIndex);
+      row.classList.toggle('row-hover', index === state.hoverChapterIndex);
+      row.classList.toggle('near-1', distance === 1);
+      row.classList.toggle('near-2', distance === 2);
+    });
+
+    if (scrollHoveredRow && state.hoverChapterIndex >= 0) {
+      requestAnimationFrame(() => {
+        state.shadow
+          .querySelector(`#chapter-body .nav-row[data-index="${state.hoverChapterIndex}"]`)
+          ?.scrollIntoView({ block: 'nearest' });
+      });
+    }
+  }
+
+  function getAnswerContentLeft(item) {
+    for (const node of [item?.assistantRoot, item?.target]) {
+      if (!node?.isConnected) continue;
+      const rect = node.getBoundingClientRect();
+      if (Number.isFinite(rect.left) && rect.width > 0) return rect.left;
+    }
+    return null;
+  }
+
+  function getLeftObstructionRight(answerLeft) {
+    let obstructionRight = 4;
+    const candidates = document.querySelectorAll(
+      'aside, nav[aria-label], [data-testid*="sidebar"]'
+    );
+
+    for (const node of candidates) {
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      const visible =
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 48 &&
+        rect.height > window.innerHeight * 0.45;
+
+      if (visible && rect.left < 24 && rect.right < answerLeft) {
+        obstructionRight = Math.max(obstructionRight, rect.right);
+      }
+    }
+
+    return obstructionRight;
+  }
+
+  function updateChapterPosition() {
+    if (!state.chapterShell || !state.chapters.length) return;
+
+    const item = state.items[state.activeIndex];
+    const answerLeft = getAnswerContentLeft(item);
+    if (answerLeft == null) return;
+
+    const anchorX = Math.max(
+      CONFIG.chapterCollapsedWidth + 4,
+      answerLeft - CONFIG.chapterGapFromAnswer
+    );
+    const obstructionRight = getLeftObstructionRight(answerLeft);
+    const availableWidth = Math.floor(
+      anchorX - obstructionRight - CONFIG.chapterObstructionGap
+    );
+
+    state.chapterShell.style.setProperty(
+      '--chapter-available-width',
+      `${Math.max(CONFIG.chapterCollapsedWidth, availableWidth)}px`
+    );
+    state.chapterShell.dataset.constrained = String(
+      availableWidth < CONFIG.chapterCollapsedWidth
+    );
+
+    if (availableWidth < CONFIG.chapterCollapsedWidth) return;
+
+    const right = Math.max(4, window.innerWidth - anchorX);
+    if (
+      state.lastChapterRight === null ||
+      Math.abs(state.lastChapterRight - right) >= 0.5
+    ) {
+      state.lastChapterRight = right;
+      state.chapterShell.style.right = `${right}px`;
+    }
+  }
+
+  function scheduleChapterPositionBurst() {
+    if (state.destroyed) return;
+    state.layoutBurstUntil = performance.now() + CONFIG.layoutSettleMs;
+    if (state.layoutTimer) return;
+
+    const tick = () => {
+      state.layoutTimer = null;
+      updateChapterPosition();
+      if (!state.destroyed && performance.now() < state.layoutBurstUntil) {
+        state.layoutTimer = setTimeout(tick, CONFIG.layoutPollMs);
+      }
+    };
+
+    tick();
+  }
+
+  function findLayoutRoots() {
+    const item = state.items[state.activeIndex];
+    return [...new Set([
+      document.documentElement,
+      document.querySelector('main, [role="main"]'),
+      state.conversationRoot,
+      item?.assistantRoot,
+      ...document.querySelectorAll('aside, nav[aria-label], [data-testid*="sidebar"]'),
+    ].filter(Boolean))];
+  }
+
+  function observeLayout() {
+    state.resizeObserver?.disconnect();
+    if (typeof ResizeObserver !== 'function') return;
+
+    state.resizeObserver = new ResizeObserver(() => {
+      scheduleChapterPositionBurst();
+    });
+
+    for (const root of findLayoutRoots()) {
+      try {
+        state.resizeObserver.observe(root);
+      } catch {}
     }
   }
 
@@ -844,14 +1239,18 @@
       ) || null;
   }
 
-  function alignItemToStart(item, behavior = 'auto') {
-    if (!item?.target?.isConnected) return;
+  function alignTargetToStart(target, behavior = 'auto') {
+    if (!target?.isConnected) return;
 
-    item.target.scrollIntoView({
+    target.scrollIntoView({
       behavior,
       block: 'start',
       inline: 'nearest',
     });
+  }
+
+  function alignItemToStart(item, behavior = 'auto') {
+    alignTargetToStart(item?.target, behavior);
   }
 
   function scrollToItem(index) {
@@ -888,6 +1287,38 @@
     setActive(index);
   }
 
+  function scrollToChapter(index) {
+    const chapter = state.chapters[index];
+    if (!chapter?.heading?.isConnected) {
+      scheduleScan(0);
+      return;
+    }
+
+    clearTimeout(state.jumpCorrectionTimer);
+    alignTargetToStart(
+      chapter.heading,
+      CONFIG.smoothScroll ? 'smooth' : 'auto'
+    );
+
+    state.jumpCorrectionTimer = setTimeout(() => {
+      if (!chapter.heading?.isConnected) return;
+
+      const viewport = getViewportMetrics();
+      const rect = chapter.heading.getBoundingClientRect();
+      const scrollMarginTop = Number.parseFloat(
+        getComputedStyle(chapter.heading).scrollMarginTop
+      ) || 0;
+      const expectedTop = viewport.top + scrollMarginTop;
+
+      if (Math.abs(rect.top - expectedTop) > 6) {
+        alignTargetToStart(chapter.heading, 'auto');
+      }
+    }, CONFIG.jumpCorrectionMs);
+
+    state.activeChapterIndex = index;
+    updateChapterVisualState(false);
+  }
+
   function navigateRelative(delta) {
     if (!state.items.length) return;
 
@@ -908,32 +1339,26 @@
       return;
     }
 
-    const viewport = getViewportMetrics();
-    const anchorY = viewport.top + viewport.height * 0.32;
+    const anchorY = getReadingAnchorY();
+    let activeIndex = 0;
 
-    let bestIndex = 0;
-    let bestDistance = Infinity;
+    for (let index = 0; index < state.items.length; index += 1) {
+      const target = state.items[index].target;
+      if (!target?.isConnected) continue;
+      if (target.getBoundingClientRect().top <= anchorY) activeIndex = index;
+      else break;
+    }
 
-    state.items.forEach((item, index) => {
-      if (!item.target?.isConnected) return;
-
-      const rect = item.target.getBoundingClientRect();
-      const y = rect.top + Math.min(rect.height * 0.22, 20);
-      const distance = Math.abs(y - anchorY);
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
-    });
-
-    setActive(bestIndex);
+    setActive(activeIndex);
   }
 
   function setActive(index) {
     if (state.activeIndex === index) return;
     state.activeIndex = index;
     updateVisualState(false);
+    refreshChapters(true);
+    observeLayout();
+    scheduleChapterPositionBurst();
   }
 
   // =========================================================
@@ -942,6 +1367,8 @@
 
   function scanMessages() {
     if (state.destroyed) return;
+
+    const previousActiveRoot = state.items[state.activeIndex]?.assistantRoot || null;
 
     let uiRecreated = false;
     if (!state.host?.isConnected) {
@@ -971,6 +1398,14 @@
       });
     }
 
+    nextItems.forEach((item, index) => {
+      item.assistantRoot = findAssistantRoot(
+        conversationRoot,
+        item.target,
+        nextItems[index + 1]?.target || null
+      );
+    });
+
     const changed =
       nextItems.length !== state.items.length ||
       nextItems.some((item, i) =>
@@ -984,6 +1419,14 @@
 
     if (changed || uiRecreated) render();
     updateActiveFromViewport();
+    refreshChapters(uiRecreated);
+    if (
+      uiRecreated ||
+      previousActiveRoot !== (state.items[state.activeIndex]?.assistantRoot || null)
+    ) {
+      observeLayout();
+    }
+    scheduleChapterPositionBurst();
   }
 
   function scheduleScan(delay = CONFIG.scanDebounceMs) {
@@ -1003,8 +1446,17 @@
   function observeDOM() {
     state.mutationObserver?.disconnect();
 
-    state.mutationObserver = new MutationObserver(() => {
+    state.mutationObserver = new MutationObserver(mutations => {
       scheduleScan();
+
+      const layoutChanged = mutations.some(mutation =>
+        mutation.type === 'childList' ||
+        (
+          mutation.type === 'attributes' &&
+          ['class', 'style', 'data-state'].includes(mutation.attributeName)
+        )
+      );
+      if (layoutChanged) scheduleChapterPositionBurst();
     });
 
     state.mutationObserver.observe(document.documentElement, {
@@ -1026,6 +1478,10 @@
         'aria-current',
         'aria-selected',
         'data-state',
+        'data-markdown-text-style',
+        'class',
+        'style',
+        'aria-hidden',
       ],
     });
   }
@@ -1037,16 +1493,27 @@
     state.scrollRAF = requestAnimationFrame(() => {
       state.scrollRAF = null;
       updateActiveFromViewport();
+      const chapterIndex = getActiveChapterIndexFromViewport();
+      if (chapterIndex !== state.activeChapterIndex) {
+        state.activeChapterIndex = chapterIndex;
+        updateChapterVisualState(false);
+      }
+      updateChapterPosition();
     });
   }
 
   function onResize() {
-    render();
     onAnyScroll();
+    observeLayout();
+    scheduleChapterPositionBurst();
   }
 
   function onVisibilityChange() {
-    if (!document.hidden) scheduleScan(0);
+    if (!document.hidden) {
+      scheduleScan(0);
+      observeLayout();
+      scheduleChapterPositionBurst();
+    }
   }
 
   function onKeyDown(event) {
@@ -1093,6 +1560,7 @@
       if (!state.host?.isConnected) {
         createUI();
         render();
+        renderChapters();
       }
 
       const nextRouteKey = getRouteKey();
@@ -1102,8 +1570,13 @@
       state.items = [];
       state.activeIndex = -1;
       state.hoverIndex = -1;
+      state.chapters = [];
+      state.activeChapterIndex = -1;
+      state.hoverChapterIndex = -1;
+      state.lastChapterRight = null;
 
       render();
+      renderChapters();
 
       scheduleScan(0);
       clearTimeout(state.lateScanTimer);
@@ -1123,7 +1596,9 @@
 
     scanMessages();
     observeDOM();
+    observeLayout();
     watchRoute();
+    scheduleChapterPositionBurst();
 
     window.addEventListener('scroll', onAnyScroll, {
       passive: true,
@@ -1145,10 +1620,12 @@
     clearTimeout(state.scanTimer);
     clearTimeout(state.lateScanTimer);
     clearTimeout(state.jumpCorrectionTimer);
+    clearTimeout(state.layoutTimer);
     clearInterval(state.routeTimer);
     if (state.scrollRAF) cancelAnimationFrame(state.scrollRAF);
 
     state.mutationObserver?.disconnect();
+    state.resizeObserver?.disconnect();
     window.removeEventListener('scroll', onAnyScroll, true);
     window.removeEventListener('resize', onResize);
     document.removeEventListener('keydown', onKeyDown, true);
